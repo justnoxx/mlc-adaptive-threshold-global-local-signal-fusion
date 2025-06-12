@@ -20,11 +20,13 @@ train_loader = DataLoader(train_ds, batch_size=128, shuffle=True, num_workers=4)
 val_loader = DataLoader(val_ds, batch_size=128, num_workers=4)
 
 # Improved model
+# Improved model
 model = MultiLabelWithAdaptiveThreshold(
     input_size=input_size,
     num_labels=num_labels,
     disable_tfidf=False,
-    disable_knn=False,
+    disable_knn=True,
+    disable_logits_knn=False,
     use_fixed_threshold=False,
     use_bias_init=True,
     use_threshold_bias=True,

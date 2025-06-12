@@ -4,17 +4,19 @@ import torch.nn.functional as F
 from tqdm import tqdm
 import json
 import os
+from sklearn.metrics.pairwise import cosine_similarity
 
 
 class MultiLabelWithAdaptiveThreshold(nn.Module):
     def __init__(self, input_size, num_labels, hidden_size=2048,
-                 disable_tfidf=False, disable_knn=False, use_fixed_threshold=False,
-                 use_bias_init=True, use_threshold_bias=True,
+                 disable_tfidf=False, disable_knn=False, disable_logits_knn=False,
+                 use_fixed_threshold=False, use_bias_init=True, use_threshold_bias=True,
                  normalize_logits=True, use_margin_loss=True):
         super().__init__()
         self.num_labels = num_labels
         self.disable_tfidf = disable_tfidf
         self.disable_knn = disable_knn
+        self.disable_logits_knn = disable_logits_knn
         self.use_fixed_threshold = use_fixed_threshold
         self.normalize_logits = normalize_logits
         self.use_margin_loss = use_margin_loss
@@ -37,32 +39,36 @@ class MultiLabelWithAdaptiveThreshold(nn.Module):
 
         self.alpha = nn.Parameter(torch.randn(num_labels))
         self.beta = nn.Parameter(torch.randn(num_labels))
+        self.gamma = nn.Parameter(torch.randn(num_labels))
         self.lam = nn.Parameter(torch.tensor(0.5))
+        self.mu = nn.Parameter(torch.tensor(0.5))
         self.threshold_bias = nn.Parameter(torch.zeros(num_labels)) if use_threshold_bias else None
 
-    def threshold_layer(self, tfidf, knn):
+    def threshold_layer(self, tfidf, knn, knn_logits):
         if self.use_fixed_threshold:
             return torch.full_like(tfidf, 0.5)
 
         w_tfidf = 0 if self.disable_tfidf else self.alpha * tfidf
         w_knn = 0 if self.disable_knn else self.beta * knn
-        threshold = self.lam * w_tfidf + (1 - self.lam) * w_knn
+        w_knn_logits = 0 if self.disable_logits_knn else self.gamma * knn_logits
+
+        w_combined_knn = self.mu * w_knn + (1 - self.mu) * w_knn_logits
+        threshold = self.lam * w_tfidf + (1 - self.lam) * w_combined_knn
         if self.threshold_bias is not None:
             threshold = threshold + self.threshold_bias
         return torch.sigmoid(threshold)
 
-    def forward(self, x, tfidf=None, knn=None):
+    def forward(self, x, tfidf=None, knn=None, knn_logits=None):
         h = self.base_model(x)
         logits = self.classifier(h)
         if self.normalize_logits:
             logits = (logits - logits.mean(dim=1, keepdim=True)) / (logits.std(dim=1, keepdim=True) + 1e-8)
 
-        if tfidf is None:
-            tfidf = torch.zeros_like(logits)
-        if knn is None:
-            knn = torch.zeros_like(logits)
+        tfidf = torch.zeros_like(logits) if tfidf is None else tfidf
+        knn = torch.zeros_like(logits) if knn is None else knn
+        knn_logits = torch.zeros_like(logits) if knn_logits is None else knn_logits
 
-        theta = self.threshold_layer(tfidf, knn)
+        theta = self.threshold_layer(tfidf, knn, knn_logits)
         adjusted_logits = logits - theta
         return adjusted_logits, logits, theta
 
@@ -110,10 +116,22 @@ def train_model(model, train_loader, val_loader, optimizer, device, epochs=20,
             knn = torch.matmul(knn, y.float())
             knn = knn.nan_to_num(0.0)
 
+            # Forward once to get logits
             x, y, tfidf, knn = x.to(device), y.to(device), tfidf.to(device), knn.to(device)
+            _, raw_logits, _ = model(x, tfidf, knn, None)
+
+            logits_cpu = raw_logits.detach().cpu().numpy()
+            sim_matrix = cosine_similarity(logits_cpu)
+            topk = 5
+            knn_logits = []
+            for i in range(len(sim_matrix)):
+                neighbors = sim_matrix[i].argsort()[-topk-1:-1]
+                neighbors_logits = raw_logits[neighbors].mean(dim=0)
+                knn_logits.append(neighbors_logits)
+            knn_logits = torch.stack(knn_logits).to(device)
 
             optimizer.zero_grad()
-            adjusted_logits, raw_logits, thresholds = model(x, tfidf, knn)
+            adjusted_logits, raw_logits, thresholds = model(x, tfidf, knn, knn_logits)
 
             loss = bce_loss_fn(adjusted_logits, y)
             if model.use_margin_loss:
@@ -146,7 +164,19 @@ def train_model(model, train_loader, val_loader, optimizer, device, epochs=20,
                 knn = knn.nan_to_num(0.0)
 
                 x, y, tfidf, knn = x.to(device), y.to(device), tfidf.to(device), knn.to(device)
-                adjusted_logits, _, _ = model(x, tfidf, knn)
+                _, raw_logits, _ = model(x, tfidf, knn, None)
+
+                logits_cpu = raw_logits.detach().cpu().numpy()
+                sim_matrix = cosine_similarity(logits_cpu)
+                topk = 5
+                knn_logits = []
+                for i in range(len(sim_matrix)):
+                    neighbors = sim_matrix[i].argsort()[-topk-1:-1]
+                    neighbors_logits = raw_logits[neighbors].mean(dim=0)
+                    knn_logits.append(neighbors_logits)
+                knn_logits = torch.stack(knn_logits).to(device)
+
+                adjusted_logits, _, _ = model(x, tfidf, knn, knn_logits)
                 preds = (torch.sigmoid(adjusted_logits) > 0.5).float()
                 all_preds.append(preds.cpu())
                 all_targets.append(y.cpu())
@@ -166,8 +196,10 @@ def train_model(model, train_loader, val_loader, optimizer, device, epochs=20,
             "lambda": model.lam.item(),
             "alpha_mean": model.alpha.mean().item(),
             "beta_mean": model.beta.mean().item(),
+            "gamma_mean": model.gamma.mean().item(),
             "alpha_std": model.alpha.std().item(),
             "beta_std": model.beta.std().item(),
+            "gamma_std": model.gamma.std().item(),
         }
         if os.path.exists(stats_path):
             with open(stats_path, "r") as f:
